@@ -84,9 +84,9 @@ STYLE_FIELD_NORMAL = (
 # Crow's Foot edge — ตรงกับ template เป๊ะ
 STYLE_EDGE = (
     "edgeStyle=entityRelationEdgeStyle;fontSize=12;html=1;"
-    "startArrow=ERmandOne;endArrow=ERzeroToMany;endFill=1;rounded=1;"
+    "startArrow=ERmandOne;endArrow=ERzeroToMany;endFill=1;rounded=0;"
     "strokeColor=default;align=center;verticalAlign=middle;"
-    "fontFamily=Helvetica;fontColor=default;labelBackgroundColor=default;curved=1;"
+    "fontFamily=Helvetica;fontColor=default;labelBackgroundColor=default;curved=0;"
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
