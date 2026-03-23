@@ -51,7 +51,7 @@ HDR_PADDING   = 24    # padding รวมของ header (ซ้าย+ขว�
 STYLE_TABLE = (
     "shape=table;startSize=30;container=1;collapsible=1;childLayout=tableLayout;"
     "fixedRows=1;rowLines=0;fontStyle=1;align=center;resizeLast=1;"
-    "aspect=fixed;arcSize=15;"
+    "aspect=fixed;rounded=1;arcSize=15;"
 )
 STYLE_ROW_PK = (
     "shape=tableRow;horizontal=0;startSize=0;swimlaneHead=0;swimlaneBody=0;"
@@ -84,7 +84,7 @@ STYLE_FIELD_NORMAL = (
 # Crow's Foot edge — ตรงกับ template เป๊ะ
 STYLE_EDGE = (
     "edgeStyle=entityRelationEdgeStyle;fontSize=12;html=1;"
-    "startArrow=ERmandOne;endArrow=ERzeroToMany;endFill=1;rounded=0;"
+    "startArrow=ERmandOne;endArrow=ERzeroToMany;endFill=1;rounded=1;"
     "strokeColor=default;align=center;verticalAlign=middle;"
     "fontFamily=Helvetica;fontColor=default;labelBackgroundColor=default;curved=0;"
 )
