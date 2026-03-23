@@ -427,9 +427,43 @@ def _make_edge_xml(src_row_id: str, tgt_row_id: str) -> str:
     )
 
 
+def _build_stub_tables(tables: list[dict]) -> list[dict]:
+    """
+    สร้าง stub table สำหรับตารางที่ถูกอ้างอิงผ่าน FK แต่ไม่มีในพจนานุกรม
+    แสดง: PK (infer จาก FK column), ..., last_update_by, last_update_dtm
+    """
+    existing = {t['name'] for t in tables}
+    refs: dict[str, list[str]] = {}
+    for tbl in tables:
+        for col in tbl['columns']:
+            ref = col['ref_table']
+            if ref and ref not in existing:
+                refs.setdefault(ref, []).append(col['name'])
+
+    stubs = []
+    for ref_name, fk_cols in sorted(refs.items()):
+        pk_col = fk_cols[0]   # infer PK จาก FK column แรกที่อ้างถึง
+        stubs.append({
+            "name":        ref_name,
+            "description": "",   # ไม่มีคำอธิบายภาษาไทย
+            "is_stub":     True,
+            "columns": [
+                {"name": pk_col,           "type": "", "nullable": "", "key": "PK", "ref_table": ""},
+                {"name": "...",            "type": "", "nullable": "", "key": "",   "ref_table": ""},
+                {"name": "last_update_by", "type": "", "nullable": "", "key": "",   "ref_table": ""},
+                {"name": "last_update_dtm","type": "", "nullable": "", "key": "",   "ref_table": ""},
+            ],
+        })
+    return stubs
+
+
 def generate_drawio(tables: list[dict]) -> str:
     """Main function: tables → Draw.io XML string"""
-    pages = layout_tables(tables)
+    # รวม stub tables สำหรับ FK ที่ชี้ไปตารางนอก data dict
+    stubs = _build_stub_tables(tables)
+    all_tables = tables + stubs
+
+    pages = layout_tables(all_tables)
 
     all_row_ids:   dict[str, dict] = {}
     page_of_table: dict[str, int]  = {}
@@ -447,7 +481,7 @@ def generate_drawio(tables: list[dict]) -> str:
     # ── Edges ─────────────────────────────────────────────────────────────
     edge_cells: dict[int, list[str]] = {i: [] for i in range(len(pages))}
 
-    for tbl in tables:
+    for tbl in all_tables:
         tbl_name = tbl['name']
         tbl_page = page_of_table.get(tbl_name)
         if tbl_page is None:
@@ -462,7 +496,7 @@ def generate_drawio(tables: list[dict]) -> str:
             if ref_page is None or ref_page != tbl_page:
                 continue
 
-            ref_tbl = next((t for t in tables if t['name'] == ref_table), None)
+            ref_tbl = next((t for t in all_tables if t['name'] == ref_table), None)
             if ref_tbl is None:
                 continue
 
