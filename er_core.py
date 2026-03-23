@@ -482,10 +482,8 @@ def _build_stub_tables(tables: list[dict]) -> list[dict]:
             "description": "",   # ไม่มีคำอธิบายภาษาไทย
             "is_stub":     True,
             "columns": [
-                {"name": pk_col,           "type": "", "nullable": "", "key": "PK", "ref_table": ""},
-                {"name": "...",            "type": "", "nullable": "", "key": "",   "ref_table": ""},
-                {"name": "last_update_by", "type": "", "nullable": "", "key": "",   "ref_table": ""},
-                {"name": "last_update_dtm","type": "", "nullable": "", "key": "",   "ref_table": ""},
+                {"name": pk_col, "type": "", "nullable": "", "key": "PK", "ref_table": ""},
+                {"name": "...",  "type": "", "nullable": "", "key": "",   "ref_table": ""},
             ],
         })
     return stubs
