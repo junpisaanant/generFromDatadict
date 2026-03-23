@@ -414,9 +414,10 @@ def _make_table_xml(tbl: dict) -> tuple[str, dict]:
             f'</mxCell>',
         ]
 
-        # Fix 5: Key label cell — กว้าง dynamic col1_w
+        # Key label cell — แสดงเฉพาะ PK เท่านั้น
+        key_label = "PK" if pk else ""
         lines += [
-            f'<mxCell id="{uid()}" value="{escape_xml(col["key"])}" '
+            f'<mxCell id="{uid()}" value="{key_label}" '
             f'style="{STYLE_KEY_CELL}" vertex="1" connectable="0" parent="{row_id}">',
             f'  <mxGeometry width="{col1_w}" height="{ROW_H}" as="geometry"/>',
             f'</mxCell>',
