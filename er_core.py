@@ -180,7 +180,9 @@ def parse_docx(source) -> list[dict]:
             pPr = elem.find(qn('w:pPr'))
             if pPr is not None:
                 pStyle = pPr.find(qn('w:pStyle'))
-                if pStyle is not None and pStyle.get(qn('w:val')) in {'3', 'Heading3', 'Heading 3', '3 '}:
+                if pStyle is not None and re.match(
+                        r'^(Heading\s*\d+|\d+)$',
+                        pStyle.get(qn('w:val'), ''), re.IGNORECASE):
                     text = ''.join(
                         t.text for t in elem.iter(qn('w:t')) if t.text
                     ).strip()
