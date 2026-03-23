@@ -39,19 +39,23 @@ MAX_Y        = 755   # เว้น margin ล่าง
 COLS_PER_ROW = 3
 
 # ── Dynamic width ────────────────────────────────────────────────────────
-MIN_TABLE_W   = 170   # กว้างขั้นต่ำของตาราง (px)
+MIN_TABLE_W   = 200   # กว้างขั้นต่ำของตาราง (px)
 CHAR_PX       = 7.5   # pixel ต่อตัวอักษร 1 ตัว (font 12px Helvetica โดยประมาณ)
 KEY_PADDING   = 14    # padding ซ้าย+ขวาของคอลัมน์ key
 FIELD_PADDING = 22    # padding ฝั่งขวาของเซลล์ field
 HDR_PADDING   = 24    # padding รวมของ header (ซ้าย+ขวา)
+TYPE_PADDING  = 16    # padding ของคอลัมน์ datatype
+MIN_TYPE_W    = 70    # กว้างขั้นต่ำของคอลัมน์ datatype (px)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DRAW.IO STYLES — คัดลอกจาก template 3_ER_จำหน่ายเครื่องจักรกล.drawio เป๊ะ 100%
 # ═══════════════════════════════════════════════════════════════════════════
+FONT_BASE     = "fontFamily=Helvetica;fontSize=12;"
+
 STYLE_TABLE = (
     "shape=table;startSize=30;container=1;collapsible=1;childLayout=tableLayout;"
     "fixedRows=1;rowLines=0;fontStyle=1;align=center;resizeLast=1;"
-    "aspect=fixed;rounded=1;arcSize=15;"
+    f"aspect=fixed;rounded=1;arcSize=15;{FONT_BASE}"
 )
 STYLE_ROW_PK = (
     "shape=tableRow;horizontal=0;startSize=0;swimlaneHead=0;swimlaneBody=0;"
@@ -68,25 +72,29 @@ STYLE_ROW_NORMAL = (
 STYLE_KEY_CELL = (
     "shape=partialRectangle;overflow=hidden;connectable=0;fillColor=none;"
     "strokeColor=inherit;top=0;left=0;bottom=0;right=0;"
-    "fontStyle=1;align=center;verticalAlign=middle;"
+    f"fontStyle=1;align=center;verticalAlign=middle;{FONT_BASE}"
 )
-# Fix 4: เพิ่ม align=left ใน FIELD_PK และ FIELD_NORMAL ทุกตัว
 STYLE_FIELD_PK = (
     "shape=partialRectangle;overflow=hidden;connectable=0;fillColor=none;"
     "align=left;strokeColor=inherit;top=0;left=0;bottom=0;right=0;"
-    "spacingLeft=6;fontStyle=5;verticalAlign=middle;"
+    f"spacingLeft=6;fontStyle=5;verticalAlign=middle;{FONT_BASE}"
 )
 STYLE_FIELD_NORMAL = (
     "shape=partialRectangle;overflow=hidden;connectable=0;fillColor=none;"
     "align=left;strokeColor=inherit;top=0;left=0;bottom=0;right=0;"
-    "spacingLeft=6;verticalAlign=middle;"
+    f"spacingLeft=6;verticalAlign=middle;{FONT_BASE}"
 )
-# Crow's Foot edge — ตรงกับ template เป๊ะ
+STYLE_TYPE_CELL = (
+    "shape=partialRectangle;overflow=hidden;connectable=0;fillColor=none;"
+    "align=right;strokeColor=inherit;top=0;left=0;bottom=0;right=0;"
+    f"spacingRight=6;verticalAlign=middle;{FONT_BASE}"
+)
+# Crow's Foot edge
 STYLE_EDGE = (
-    "edgeStyle=entityRelationEdgeStyle;fontSize=12;html=1;"
+    "edgeStyle=entityRelationEdgeStyle;html=1;"
     "startArrow=ERmandOne;endArrow=ERzeroToMany;endFill=1;rounded=1;"
     "strokeColor=default;align=center;verticalAlign=middle;"
-    "fontFamily=Helvetica;fontColor=default;labelBackgroundColor=default;curved=0;"
+    f"fontColor=default;labelBackgroundColor=default;curved=0;{FONT_BASE}"
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -118,6 +126,12 @@ def _extract_thai_name(description: str) -> str:
     thai = re.sub(r'\s*\([A-Z][A-Z0-9_]+\)\s*$', '', description).strip()
     return thai
 
+def _calc_col3_width(tbl: dict) -> int:
+    """คำนวณความกว้างคอลัมน์ datatype แบบ dynamic"""
+    max_type = max((len(c['type']) for c in tbl['columns'] if c['type']), default=4)
+    w = int(max_type * CHAR_PX) + TYPE_PADDING
+    return max(MIN_TYPE_W, (w + 9) // 10 * 10)   # round up to nearest 10px
+
 def _calc_col1_width(tbl: dict) -> int:
     """
     Fix 5: คำนวณความกว้างคอลัมน์ Key (PK/FK/CHK) แบบ dynamic
@@ -128,10 +142,11 @@ def _calc_col1_width(tbl: dict) -> int:
     w = int(max_key * CHAR_PX) + KEY_PADDING
     return max(MIN_COL1_W, (w + 4) // 5 * 5)   # round up to nearest 5px
 
-def _calc_table_width(tbl: dict, col1_w: int) -> int:
+def _calc_table_width(tbl: dict, col1_w: int, col3_w: int) -> int:
     """
     คำนวณความกว้างตารางอัตโนมัติ
-    - col1_w: dynamic key column width (จาก _calc_col1_width)
+    - col1_w: dynamic key column width
+    - col3_w: dynamic datatype column width
     - ใช้ชื่อ field ที่ยาวที่สุดเป็นตัวกำหนด field column
     - คำนึงถึงความยาวชื่อตาราง (header) ด้วย
     """
@@ -139,8 +154,8 @@ def _calc_table_width(tbl: dict, col1_w: int) -> int:
     thai = _extract_thai_name(tbl.get('description', ''))
     max_hdr = max(len(tbl['name']), len(thai), 10)
 
-    # field cell: col1_w + spacingLeft(6) + text + right padding
-    field_needed = col1_w + 6 + int(max_field * CHAR_PX) + FIELD_PADDING
+    # field cell: col1_w + spacingLeft(6) + text + field padding + col3_w
+    field_needed = col1_w + 6 + int(max_field * CHAR_PX) + FIELD_PADDING + col3_w
     # header (centered): text + padding ทั้งสองข้าง
     hdr_needed = int(max_hdr * CHAR_PX) + HDR_PADDING
 
@@ -279,9 +294,10 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
     - Dynamic width: แต่ละตารางกว้างตามเนื้อหา
     - Column step = max(table width) + GAP_W เพื่อไม่ให้ทับกัน
     """
-    # ── Pre-compute dynamic widths (col1 + total) ────────────────────────
-    tbl_col1   = {tbl['name']: _calc_col1_width(tbl)              for tbl in tables}
-    tbl_widths = {tbl['name']: _calc_table_width(tbl, tbl_col1[tbl['name']]) for tbl in tables}
+    # ── Pre-compute dynamic widths (col1 + col3 + total) ─────────────────
+    tbl_col1   = {tbl['name']: _calc_col1_width(tbl)                                        for tbl in tables}
+    tbl_col3   = {tbl['name']: _calc_col3_width(tbl)                                        for tbl in tables}
+    tbl_widths = {tbl['name']: _calc_table_width(tbl, tbl_col1[tbl['name']], tbl_col3[tbl['name']]) for tbl in tables}
     max_tbl_w  = max(tbl_widths.values(), default=MIN_TABLE_W)
     col_step   = max_tbl_w + GAP_W   # ระยะ x ระหว่างคอลัมน์ (ใช้ตัวที่กว้างสุด)
 
@@ -316,6 +332,7 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
         t['y']      = cur_y
         t['width']  = tbl_widths[tbl['name']]   # ← dynamic total width
         t['col1_w'] = tbl_col1[tbl['name']]     # ← dynamic key-col width
+        t['col3_w'] = tbl_col3[tbl['name']]     # ← dynamic type-col width
         t['height'] = h
         current_page.append(t)
         max_h_in_row = max(max_h_in_row, h)
@@ -360,8 +377,9 @@ def _make_table_xml(tbl: dict) -> tuple[str, dict]:
     tbl_id  = uid()
     row_ids: dict[str, str] = {}
     x, y, w, h = tbl['x'], tbl['y'], tbl['width'], tbl['height']
-    col1_w = tbl.get('col1_w', MIN_COL1_W)   # Fix 5: dynamic key-col width
-    col2_w = w - col1_w                        # field column = total - key col
+    col1_w = tbl.get('col1_w', MIN_COL1_W)   # dynamic key-col width
+    col3_w = tbl.get('col3_w', MIN_TYPE_W)   # dynamic type-col width
+    col2_w = w - col1_w - col3_w             # field column = total - key - type
 
     # Fix 3: header = "EN_NAME\nชื่อภาษาไทย"
     thai_name  = _extract_thai_name(tbl.get('description', ''))
@@ -399,7 +417,7 @@ def _make_table_xml(tbl: dict) -> tuple[str, dict]:
             f'</mxCell>',
         ]
 
-        # Fix 2: ชื่อ field เท่านั้น | Fix 4: align=left ใน style แล้ว
+        # Field name cell (align=left)
         field_label = escape_xml(col['name'])
         lines += [
             f'<mxCell id="{uid()}" value="{field_label}" '
@@ -408,19 +426,29 @@ def _make_table_xml(tbl: dict) -> tuple[str, dict]:
             f'</mxCell>',
         ]
 
+        # Datatype cell (align=right)
+        type_label = escape_xml(col.get('type', ''))
+        lines += [
+            f'<mxCell id="{uid()}" value="{type_label}" '
+            f'style="{STYLE_TYPE_CELL}" vertex="1" connectable="0" parent="{row_id}">',
+            f'  <mxGeometry x="{col1_w + col2_w}" width="{col3_w}" height="{ROW_H}" as="geometry"/>',
+            f'</mxCell>',
+        ]
+
         row_y += ROW_H
 
     return '\n'.join(lines), row_ids
 
 
-def _make_edge_xml(src_row_id: str, tgt_row_id: str) -> str:
+def _make_edge_xml(src_row_id: str, tgt_row_id: str, label: str = "") -> str:
     """
     Crow's Foot edge:
       source = PK row ของตาราง parent (ฝั่ง "one"  → ERmandOne)
       target = FK row ของตาราง child  (ฝั่ง "many" → ERzeroToMany)
+      label  = "fk_col = pk_col"
     """
     return (
-        f'<mxCell id="{uid()}" value="" style="{STYLE_EDGE}" '
+        f'<mxCell id="{uid()}" value="{escape_xml(label)}" style="{STYLE_EDGE}" '
         f'edge="1" source="{src_row_id}" target="{tgt_row_id}" parent="1">'
         f'<mxGeometry relative="1" as="geometry"/>'
         f'</mxCell>'
@@ -507,7 +535,8 @@ def generate_drawio(tables: list[dict]) -> str:
             src_id = all_row_ids.get(ref_table, {}).get(pk_cols[0]['name'])
             tgt_id = tbl_row_ids.get(col['name'])
             if src_id and tgt_id:
-                edge_cells[tbl_page].append(_make_edge_xml(src_id, tgt_id))
+                label = f"{col['name']} = {pk_cols[0]['name']}"
+                edge_cells[tbl_page].append(_make_edge_xml(src_id, tgt_id, label))
 
     # ── Assemble mxfile ────────────────────────────────────────────────────
     parts = [
