@@ -86,8 +86,13 @@ STYLE_FIELD_NORMAL = (
 )
 STYLE_TYPE_CELL = (
     "shape=partialRectangle;overflow=hidden;connectable=0;fillColor=none;"
-    "align=right;strokeColor=inherit;top=0;left=0;bottom=0;right=0;"
-    f"spacingRight=6;verticalAlign=middle;{FONT_BASE}"
+    "align=left;strokeColor=inherit;top=0;left=0;bottom=0;right=0;"
+    f"spacingLeft=6;verticalAlign=middle;{FONT_BASE}"
+)
+STYLE_TYPE_PK = (
+    "shape=partialRectangle;overflow=hidden;connectable=0;fillColor=none;"
+    "align=left;strokeColor=inherit;top=0;left=0;bottom=0;right=0;"
+    f"spacingLeft=6;fontStyle=5;verticalAlign=middle;{FONT_BASE}"
 )
 # Crow's Foot edge
 STYLE_EDGE = (
@@ -426,11 +431,12 @@ def _make_table_xml(tbl: dict) -> tuple[str, dict]:
             f'</mxCell>',
         ]
 
-        # Datatype cell (align=right)
+        # Datatype cell (left-align; PK row = bold+underline)
+        type_style = STYLE_TYPE_PK if pk else STYLE_TYPE_CELL
         type_label = escape_xml(col.get('type', ''))
         lines += [
             f'<mxCell id="{uid()}" value="{type_label}" '
-            f'style="{STYLE_TYPE_CELL}" vertex="1" connectable="0" parent="{row_id}">',
+            f'style="{type_style}" vertex="1" connectable="0" parent="{row_id}">',
             f'  <mxGeometry x="{col1_w + col2_w}" width="{col3_w}" height="{ROW_H}" as="geometry"/>',
             f'</mxCell>',
         ]
