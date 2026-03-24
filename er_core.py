@@ -36,7 +36,8 @@ START_Y      = 40
 PAGE_W       = 1169  # A4 Landscape
 PAGE_H       = 827
 MAX_Y        = 755   # เว้น margin ล่าง
-COLS_PER_ROW = 3
+COLS_PER_ROW    = 3
+MAX_TABLE_ROWS  = 20   # จำนวน row สูงสุดต่อตาราง ก่อนแบ่งเป็น (ต่อ)
 
 # ── Dynamic width ────────────────────────────────────────────────────────
 MIN_TABLE_W   = 200   # กว้างขั้นต่ำของตาราง (px)
@@ -265,6 +266,12 @@ def _build_fk_graph(tables: list[dict]) -> dict[str, set]:
             if ref and ref in table_names:
                 adj[tbl['name']].add(ref)
                 adj[ref].add(tbl['name'])
+        # เชื่อม continuation parts กับ original ให้อยู่ sheet เดียวกัน
+        if tbl.get('is_continuation'):
+            orig = tbl.get('original_name')
+            if orig and orig in adj:
+                adj[tbl['name']].add(orig)
+                adj[orig].add(tbl['name'])
     return adj
 
 def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[dict]]:
@@ -386,9 +393,13 @@ def _make_table_xml(tbl: dict) -> tuple[str, dict]:
     col3_w = tbl.get('col3_w', MIN_TYPE_W)   # dynamic type-col width
     col2_w = w - col1_w - col3_w             # field column = total - key - type
 
-    # Fix 3: header = "EN_NAME\nชื่อภาษาไทย"
-    thai_name  = _extract_thai_name(tbl.get('description', ''))
-    tbl_label  = escape_xml(f"{tbl['name']}\n{thai_name}")
+    # Header: continuation → "TABLE_NAME (ต่อ)", ปกติ → "EN_NAME\nThai"
+    if tbl.get('is_continuation'):
+        orig_name = tbl.get('original_name', tbl['name'])
+        tbl_label = escape_xml(f"{orig_name} (ต่อ)")
+    else:
+        thai_name = _extract_thai_name(tbl.get('description', ''))
+        tbl_label = escape_xml(f"{tbl['name']}\n{thai_name}")
 
     lines = [
         f'<mxCell id="{tbl_id}" value="{tbl_label}" '
@@ -490,11 +501,40 @@ def _build_stub_tables(tables: list[dict]) -> list[dict]:
     return stubs
 
 
+def split_tall_tables(tables: list[dict]) -> list[dict]:
+    """
+    ตัดตารางที่มีคอลัมน์มากกว่า MAX_TABLE_ROWS ออกเป็นหลายส่วน
+    - ส่วนที่ 1: ชื่อตารางปกติ
+    - ส่วนที่ 2+: ชื่อตาราง + "(ต่อ)", is_continuation=True
+    """
+    result = []
+    for tbl in tables:
+        cols = tbl['columns']
+        if len(cols) <= MAX_TABLE_ROWS:
+            result.append(tbl)
+            continue
+        chunks = [cols[i:i + MAX_TABLE_ROWS]
+                  for i in range(0, len(cols), MAX_TABLE_ROWS)]
+        for part_idx, chunk in enumerate(chunks):
+            new_tbl = dict(tbl)
+            new_tbl['columns'] = list(chunk)
+            if part_idx == 0:
+                new_tbl['is_continuation'] = False
+            else:
+                new_tbl['is_continuation'] = True
+                new_tbl['original_name']   = tbl['name']
+                new_tbl['name'] = f"{tbl['name']}__part{part_idx + 1}"
+            result.append(new_tbl)
+    return result
+
+
 def generate_drawio(tables: list[dict]) -> str:
     """Main function: tables → Draw.io XML string"""
-    # รวม stub tables สำหรับ FK ที่ชี้ไปตารางนอก data dict
-    stubs = _build_stub_tables(tables)
-    all_tables = tables + stubs
+    # 1) ตัดตารางที่ยาวเกิน MAX_TABLE_ROWS → (ต่อ)
+    split_tables = split_tall_tables(tables)
+    # 2) stub tables สำหรับ FK ที่ชี้ไปตารางนอก data dict
+    stubs = _build_stub_tables(tables)   # ใช้ original tables ตรวจ FK
+    all_tables = split_tables + stubs
 
     pages = layout_tables(all_tables)
 
