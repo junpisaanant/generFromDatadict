@@ -11,6 +11,7 @@ er_core.py – Shared logic for ER Diagram Generator
 """
 
 import io
+import math
 import re
 import uuid
 from collections import deque
@@ -36,7 +37,8 @@ START_Y      = 40
 PAGE_W       = 1169  # A4 Landscape
 PAGE_H       = 827
 MAX_Y        = 755   # เว้น margin ล่าง
-COLS_PER_ROW       = 3    # สูงสุด (ลด dynamic ถ้าตารางกว้าง)
+COLS_PER_ROW       = 2    # สูงสุด 2 คอลัมน์ (ลด dynamic ถ้าตารางกว้าง)
+MAX_ROWS_PER_PAGE  = 2    # สูงสุด 2 แถว → max 4 ตารางต่อหน้า
 MAX_TABLE_ROWS     = 9    # จำนวน row สูงสุดต่อตาราง ก่อนแบ่งเป็น (ต่อ)
 CATEGORY_LABEL_H   = 28   # ความสูง category label bar
 CATEGORY_LABEL_GAP = 8    # ช่องว่างระหว่าง label กับตารางแรก
@@ -290,6 +292,7 @@ def _build_fk_graph(tables: list[dict]) -> dict[str, set]:
     return adj
 
 def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[dict]]:
+    """หา connected components แล้วเรียงตาราง greedy ตาม FK closeness"""
     table_map = {t['name']: t for t in tables}
     visited: set[str] = set()
     components: list[list[dict]] = []
@@ -298,7 +301,8 @@ def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[
         name = tbl['name']
         if name in visited:
             continue
-        group: list[dict] = []
+        # BFS หา component
+        comp_names: list[str] = []
         q = deque([name])
         while q:
             n = q.popleft()
@@ -306,11 +310,35 @@ def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[
                 continue
             visited.add(n)
             if n in table_map:
-                group.append(table_map[n])
+                comp_names.append(n)
             for nb in sorted(adj.get(n, set())):
                 if nb not in visited:
                     q.append(nb)
-        components.append(group)
+
+        # Greedy ordering: เลือกตารางถัดไปที่มี FK ใกล้ชิดกับตารางที่วางล่าสุดมากที่สุด
+        # เพื่อให้ FK-connected pairs อยู่ใกล้ๆ กันในลำดับการวาง
+        remaining = set(comp_names)
+        ordered: list[str] = []
+        recent_window: set[str] = set()  # ตาราง 4 ตัวล่าสุดใน ordered
+
+        while remaining:
+            if not ordered:
+                # seed = ตารางที่มี degree สูงสุด (มี FK มากที่สุด)
+                seed = max(remaining, key=lambda n: len(adj.get(n, set()) & remaining))
+            else:
+                # เลือกตารางที่มี FK ถึง recent_window มากที่สุด
+                def score(n: str) -> int:
+                    return len(adj.get(n, set()) & recent_window)
+                candidates = sorted(remaining, key=score, reverse=True)
+                seed = candidates[0]
+            ordered.append(seed)
+            remaining.discard(seed)
+            recent_window.add(seed)
+            if len(recent_window) > 4:
+                oldest = ordered[-(len(recent_window)):][0]
+                recent_window.discard(oldest)
+
+        components.append([table_map[n] for n in ordered if n in table_map])
 
     return components
 
@@ -350,34 +378,39 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
     pages:        list[list[dict]] = []
     current_page: list[dict]       = []
     col_idx      = 0
+    row_count    = 0   # จำนวนแถวที่วางแล้วใน page ปัจจุบัน
     cur_y        = START_Y
     max_h_in_row = 0
 
     def flush_page():
-        nonlocal current_page, col_idx, cur_y, max_h_in_row
+        nonlocal current_page, col_idx, row_count, cur_y, max_h_in_row
         if current_page:
             pages.append(current_page)
         current_page = []
         col_idx      = 0
+        row_count    = 0
         cur_y        = START_Y
         max_h_in_row = 0
 
     def finish_row():
         """เลื่อน cur_y ถ้า col_idx > 0 (flush row ปัจจุบัน)"""
-        nonlocal col_idx, cur_y, max_h_in_row
+        nonlocal col_idx, row_count, cur_y, max_h_in_row
         if col_idx > 0:
             cur_y       += max_h_in_row + GAP_H
             max_h_in_row = 0
             col_idx      = 0
+            row_count   += 1
 
     def ensure_space(h: int):
         """ตรวจสอบว่า h px พอดีในหน้าปัจจุบัน ถ้าไม่พอ flush"""
-        nonlocal col_idx, cur_y, max_h_in_row
+        nonlocal col_idx, row_count, cur_y, max_h_in_row
         if col_idx >= cols_per_row:          # row เต็ม → เลื่อน row
             cur_y       += max_h_in_row + GAP_H
             max_h_in_row = 0
             col_idx      = 0
-        if cur_y + h > MAX_Y and current_page:
+            row_count   += 1
+        # flush ถ้าเกิน A4 หรือเกิน MAX_ROWS_PER_PAGE
+        if (cur_y + h > MAX_Y or row_count >= MAX_ROWS_PER_PAGE) and current_page:
             flush_page()
 
     def add_category_label(label: str):
@@ -412,16 +445,44 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
         max_h_in_row = max(max_h_in_row, h)
         col_idx += 1
 
+    def _comp_height(comp: list) -> int:
+        """คำนวณความสูงรวมของ component เมื่อวางใน grid cols_per_row"""
+        n = len(comp)
+        n_rows = math.ceil(n / cols_per_row)
+        row_heights = []
+        for r in range(n_rows):
+            chunk = comp[r * cols_per_row: (r + 1) * cols_per_row]
+            row_heights.append(max(_table_height(t) for t in chunk))
+        return sum(row_heights) + GAP_H * max(0, n_rows - 1)
+
+    def add_component(comp: list):
+        """วาง connected component โดยพยายามให้อยู่ใน page เดียวกัน"""
+        nonlocal col_idx, row_count, cur_y, max_h_in_row
+
+        # จบ row ปัจจุบันก่อน (เพื่อให้ comp เริ่มต้นแถวใหม่เสมอ)
+        finish_row()
+
+        comp_h = _comp_height(comp)
+        page_available = MAX_Y - START_Y
+
+        # ถ้า component พอดีใน 1 page แต่ไม่พอใน page ปัจจุบัน → flush ก่อน
+        if comp_h <= page_available and current_page and (
+                cur_y + comp_h > MAX_Y or row_count >= MAX_ROWS_PER_PAGE):
+            flush_page()
+
+        # วางตารางทีละตัว (ensure_space จัดการ row wrap / page overflow)
+        for tbl in comp:
+            add_table(tbl)
+
     # ── 5. Place tables category by category ─────────────────────────────
     for cat in cat_order:
         cat_tbls = cat_tables[cat]
         # FK-aware BFS within this category only
-        adj  = _build_fk_graph(cat_tbls)
+        adj   = _build_fk_graph(cat_tbls)
         comps = _connected_components(cat_tbls, adj)
         add_category_label(cat)
         for comp in comps:
-            for tbl in comp:
-                add_table(tbl)
+            add_component(comp)
 
     if current_page:
         pages.append(current_page)
@@ -545,17 +606,27 @@ def _build_stub_tables(tables: list[dict]) -> list[dict]:
             if ref and ref not in existing:
                 refs.setdefault(ref, []).append(col['name'])
 
+    # เก็บ type ของ FK column เพื่อใช้ใน stub PK
+    ref_types: dict[str, str] = {}
+    for tbl in tables:
+        for col in tbl['columns']:
+            ref = col['ref_table']
+            if ref and ref not in existing:
+                if ref not in ref_types:
+                    ref_types[ref] = col.get('type', '')
+
     stubs = []
     for ref_name, fk_cols in sorted(refs.items()):
-        pk_col = fk_cols[0]   # infer PK จาก FK column แรกที่อ้างถึง
+        pk_col   = fk_cols[0]   # infer PK จาก FK column แรกที่อ้างถึง
+        pk_type  = ref_types.get(ref_name, '')
         stubs.append({
             "name":        ref_name,
             "description": "",
             "category":    "ตารางอ้างอิง (ภายนอก)",
             "is_stub":     True,
             "columns": [
-                {"name": pk_col, "type": "", "nullable": "", "key": "PK", "ref_table": ""},
-                {"name": "...",  "type": "", "nullable": "", "key": "",   "ref_table": ""},
+                {"name": pk_col, "type": pk_type, "nullable": "", "key": "PK", "ref_table": ""},
+                {"name": "...",  "type": "",       "nullable": "", "key": "",   "ref_table": ""},
             ],
         })
     return stubs
@@ -576,8 +647,9 @@ def split_tall_tables(tables: list[dict]) -> list[dict]:
             continue
         chunks = [cols[i:i + MAX_TABLE_ROWS]
                   for i in range(0, len(cols), MAX_TABLE_ROWS)]
-        # ถ้า chunk สุดท้ายมีแค่ 1 field → รวมกลับ chunk ก่อนหน้า
-        if len(chunks) > 1 and len(chunks[-1]) == 1:
+        # ถ้า chunk สุดท้ายมีน้อยกว่า 6 field → รวมกลับ chunk ก่อนหน้า
+        # (แต่ละ chunk ที่แตกออกมาต้องมีมากกว่า 5 แถว)
+        if len(chunks) > 1 and len(chunks[-1]) <= 5:
             chunks[-2] = chunks[-2] + chunks[-1]
             chunks.pop()
         for part_idx, chunk in enumerate(chunks):
