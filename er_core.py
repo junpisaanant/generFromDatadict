@@ -39,7 +39,7 @@ PAGE_H       = 827
 MAX_Y        = 755   # เว้น margin ล่าง
 COLS_PER_ROW       = 2    # สูงสุด 2 คอลัมน์ (ลด dynamic ถ้าตารางกว้าง)
 MAX_ROWS_PER_PAGE  = 2    # สูงสุด 2 แถว → max 4 ตารางต่อหน้า
-MAX_TABLE_ROWS     = 9    # จำนวน row สูงสุดต่อตาราง ก่อนแบ่งเป็น (ต่อ)
+MAX_TABLE_ROWS     = 0    # 0 = ไม่แบ่งตาราง (แสดงเต็มทุก column)
 CATEGORY_LABEL_H   = 28   # ความสูง category label bar
 CATEGORY_LABEL_GAP = 8    # ช่องว่างระหว่าง label กับตารางแรก
 
@@ -716,10 +716,13 @@ def _build_stub_tables(tables: list[dict]) -> list[dict]:
 def split_tall_tables(tables: list[dict]) -> list[dict]:
     """
     ตัดตารางที่มีคอลัมน์มากกว่า MAX_TABLE_ROWS ออกเป็นหลายส่วน
+    - MAX_TABLE_ROWS = 0 → ไม่แบ่ง (แสดงตารางเต็มทุก column)
     - ส่วนที่ 1: ชื่อตารางปกติ
     - ส่วนที่ 2+: ชื่อตาราง + "(ต่อ)", is_continuation=True
-    - กฎ: ถ้า chunk สุดท้ายมีแค่ 1 field ให้รวมกลับ chunk ก่อนหน้า
     """
+    if MAX_TABLE_ROWS <= 0:
+        return list(tables)   # ไม่แบ่ง — คืนทุกตารางตามเดิม
+
     result = []
     for tbl in tables:
         cols = tbl['columns']
@@ -728,8 +731,6 @@ def split_tall_tables(tables: list[dict]) -> list[dict]:
             continue
         chunks = [cols[i:i + MAX_TABLE_ROWS]
                   for i in range(0, len(cols), MAX_TABLE_ROWS)]
-        # ถ้า chunk สุดท้ายมีน้อยกว่า 6 field → รวมกลับ chunk ก่อนหน้า
-        # (แต่ละ chunk ที่แตกออกมาต้องมีมากกว่า 5 แถว)
         if len(chunks) > 1 and len(chunks[-1]) <= 5:
             chunks[-2] = chunks[-2] + chunks[-1]
             chunks.pop()
