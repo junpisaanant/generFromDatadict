@@ -11,6 +11,7 @@ er_core.py – Shared logic for ER Diagram Generator
 """
 
 import io
+import math
 import re
 import uuid
 from collections import deque
@@ -36,7 +37,11 @@ START_Y      = 40
 PAGE_W       = 1169  # A4 Landscape
 PAGE_H       = 827
 MAX_Y        = 755   # เว้น margin ล่าง
-COLS_PER_ROW = 3
+COLS_PER_ROW       = 2    # สูงสุด 2 คอลัมน์ (ลด dynamic ถ้าตารางกว้าง)
+MAX_ROWS_PER_PAGE  = 2    # สูงสุด 2 แถว → max 4 ตารางต่อหน้า
+MAX_TABLE_ROWS     = 9    # จำนวน row สูงสุดต่อตาราง ก่อนแบ่งเป็น (ต่อ)
+CATEGORY_LABEL_H   = 28   # ความสูง category label bar
+CATEGORY_LABEL_GAP = 8    # ช่องว่างระหว่าง label กับตารางแรก
 
 # ── Dynamic width ────────────────────────────────────────────────────────
 MIN_TABLE_W   = 200   # กว้างขั้นต่ำของตาราง (px)
@@ -46,6 +51,11 @@ FIELD_PADDING = 22    # padding ฝั่งขวาของเซลล์ fi
 HDR_PADDING   = 24    # padding รวมของ header (ซ้าย+ขวา)
 TYPE_PADDING  = 16    # padding ของคอลัมน์ datatype
 MIN_TYPE_W    = 70    # กว้างขั้นต่ำของคอลัมน์ datatype (px)
+
+# ── Stacked row format ──────────────────────────────────────────────────
+# Non-PK fields จะถูกรวมเป็น 1 row (stacked) แทนที่จะเป็น row ละ field
+LINE_H        = 15    # draw.io renders ~15px per text line at fontSize=12
+PAD_BOT       = 6     # padding below last field in stacked row
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DRAW.IO STYLES — คัดลอกจาก template 3_ER_จำหน่ายเครื่องจักรกล.drawio เป๊ะ 100%
@@ -93,6 +103,34 @@ STYLE_TYPE_PK = (
     "shape=partialRectangle;overflow=hidden;connectable=0;fillColor=none;"
     "align=left;strokeColor=inherit;top=0;left=0;bottom=0;right=0;"
     f"spacingLeft=6;fontStyle=5;verticalAlign=middle;{FONT_BASE}"
+)
+
+# ── Stacked row styles (non-PK fields combined into 1 row) ─────────────
+STYLE_ROW_STACKED = (
+    "shape=tableRow;horizontal=0;startSize=0;swimlaneHead=0;swimlaneBody=0;"
+    "fillColor=none;collapsible=0;dropTarget=0;points=[[0,0.5],[1,0.5]];"
+    f"portConstraint=eastwest;{FONT_BASE}"
+    "top=0;left=0;right=0;bottom=0;"
+)
+STYLE_STACKED_KEY = (
+    "shape=partialRectangle;connectable=0;fillColor=none;"
+    "top=0;left=0;bottom=0;right=0;fontStyle=0;overflow=hidden;"
+    "strokeColor=inherit;"
+)
+STYLE_STACKED_FIELD = (
+    "shape=partialRectangle;connectable=0;fillColor=none;"
+    "top=0;left=0;bottom=0;right=0;overflow=hidden;fontStyle=0;"
+    "align=left;verticalAlign=top;spacingLeft=6;strokeColor=inherit;"
+)
+STYLE_STACKED_TYPE = (
+    "shape=partialRectangle;connectable=0;fillColor=none;"
+    "top=0;left=0;bottom=0;right=0;overflow=hidden;fontStyle=0;"
+    "align=left;verticalAlign=top;spacingLeft=6;strokeColor=inherit;"
+)
+STYLE_CATEGORY_LABEL = (
+    "text;html=1;strokeColor=#6c8ebf;fillColor=#dae8fc;"
+    "align=left;verticalAlign=middle;spacingLeft=10;"
+    "fontStyle=1;fontFamily=Helvetica;fontSize=13;rounded=1;"
 )
 # Crow's Foot edge
 STYLE_EDGE = (
@@ -192,6 +230,7 @@ def parse_docx(source) -> list[dict]:
 
     tables = []
     current_heading = None
+    current_category = ""          # Heading 1/2 → category label
 
     for elem in doc.element.body:
         tag = elem.tag.split('}')[-1]
@@ -206,9 +245,15 @@ def parse_docx(source) -> list[dict]:
                     text = ''.join(
                         t.text for t in elem.iter(qn('w:t')) if t.text
                     ).strip()
+                    level_m = re.search(r'\d+', pStyle.get(qn('w:val'), ''))
+                    level   = int(level_m.group()) if level_m else 99
                     m = re.search(r'\(([A-Z][A-Z0-9_]+)\)', text)
                     if m:
+                        # มี (TABLE_NAME) ในวงเล็บ → table heading ทุก level
                         current_heading = (m.group(1), text)
+                    elif level <= 2 and text:
+                        # ไม่มี TABLE_NAME + level ≤ 2 → category label
+                        current_category = text
 
         elif tag == 'tbl':
             if current_heading is None:
@@ -244,6 +289,7 @@ def parse_docx(source) -> list[dict]:
             tables.append({
                 "name":        tbl_name,
                 "description": tbl_desc,
+                "category":    current_category,
                 "columns":     columns,
             })
 
@@ -254,7 +300,16 @@ def parse_docx(source) -> list[dict]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _table_height(tbl: dict) -> int:
-    return HEADER_H + ROW_H * len(tbl["columns"])
+    """
+    ความสูงตาราง = Header + PK rows (individual) + Stacked row (non-PK fields)
+    - PK row: 30px ต่อ row (แบบปกติ)
+    - Non-PK fields: รวมเป็น 1 stacked row → n_non_pk × LINE_H + PAD_BOT
+    """
+    cols = tbl["columns"]
+    n_pk = sum(1 for c in cols if is_pk(c.get("key", "")))
+    n_non_pk = len(cols) - n_pk
+    stacked_h = max(LINE_H + PAD_BOT, n_non_pk * LINE_H + PAD_BOT) if n_non_pk > 0 else 0
+    return HEADER_H + ROW_H * n_pk + stacked_h
 
 def _build_fk_graph(tables: list[dict]) -> dict[str, set]:
     table_names = {t['name'] for t in tables}
@@ -265,9 +320,16 @@ def _build_fk_graph(tables: list[dict]) -> dict[str, set]:
             if ref and ref in table_names:
                 adj[tbl['name']].add(ref)
                 adj[ref].add(tbl['name'])
+        # เชื่อม continuation parts กับ original ให้อยู่ sheet เดียวกัน
+        if tbl.get('is_continuation'):
+            orig = tbl.get('original_name')
+            if orig and orig in adj:
+                adj[tbl['name']].add(orig)
+                adj[orig].add(tbl['name'])
     return adj
 
 def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[dict]]:
+    """หา connected components แล้วเรียงตาราง greedy ตาม FK closeness"""
     table_map = {t['name']: t for t in tables}
     visited: set[str] = set()
     components: list[list[dict]] = []
@@ -276,7 +338,8 @@ def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[
         name = tbl['name']
         if name in visited:
             continue
-        group: list[dict] = []
+        # BFS หา component
+        comp_names: list[str] = []
         q = deque([name])
         while q:
             n = q.popleft()
@@ -284,89 +347,179 @@ def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[
                 continue
             visited.add(n)
             if n in table_map:
-                group.append(table_map[n])
+                comp_names.append(n)
             for nb in sorted(adj.get(n, set())):
                 if nb not in visited:
                     q.append(nb)
-        components.append(group)
+
+        # Greedy ordering: เลือกตารางถัดไปที่มี FK ใกล้ชิดกับตารางที่วางล่าสุดมากที่สุด
+        # เพื่อให้ FK-connected pairs อยู่ใกล้ๆ กันในลำดับการวาง
+        remaining = set(comp_names)
+        ordered: list[str] = []
+        recent_window: set[str] = set()  # ตาราง 4 ตัวล่าสุดใน ordered
+
+        while remaining:
+            if not ordered:
+                # seed = ตารางที่มี degree สูงสุด (มี FK มากที่สุด)
+                seed = max(remaining, key=lambda n: len(adj.get(n, set()) & remaining))
+            else:
+                # เลือกตารางที่มี FK ถึง recent_window มากที่สุด
+                def score(n: str) -> int:
+                    return len(adj.get(n, set()) & recent_window)
+                candidates = sorted(remaining, key=score, reverse=True)
+                seed = candidates[0]
+            ordered.append(seed)
+            remaining.discard(seed)
+            recent_window.add(seed)
+            if len(recent_window) > 4:
+                oldest = ordered[-(len(recent_window)):][0]
+                recent_window.discard(oldest)
+
+        components.append([table_map[n] for n in ordered if n in table_map])
 
     return components
 
 def layout_tables(tables: list[dict]) -> list[list[dict]]:
     """
-    จัด layout A4 Landscape (3 col grid) พร้อม:
-    - FK-aware grouping: ตารางที่เชื่อมกันอยู่หน้าเดียวกัน
-    - Dynamic width: แต่ละตารางกว้างตามเนื้อหา
-    - Column step = max(table width) + GAP_W เพื่อไม่ให้ทับกัน
+    จัด layout A4 Landscape พร้อม:
+    - Dynamic cols_per_row: คำนวณจากความกว้างจริงของตาราง ไม่ให้เกิน A4
+    - Strict A4 boundary: ทุก element อยู่ภายใน MAX_Y เสมอ
+    - Category grouping: จัดหมวดหมู่ตาม Heading 2 ในเอกสาร
+    - FK-aware (within category): ตารางที่มี FK ถึงกันอยู่ page เดียวกัน
     """
-    # ── Pre-compute dynamic widths (col1 + col3 + total) ─────────────────
-    tbl_col1   = {tbl['name']: _calc_col1_width(tbl)                                        for tbl in tables}
-    tbl_col3   = {tbl['name']: _calc_col3_width(tbl)                                        for tbl in tables}
-    tbl_widths = {tbl['name']: _calc_table_width(tbl, tbl_col1[tbl['name']], tbl_col3[tbl['name']]) for tbl in tables}
+    # ── 1. Pre-compute widths ─────────────────────────────────────────────
+    tbl_col1   = {t['name']: _calc_col1_width(t) for t in tables}
+    tbl_col3   = {t['name']: _calc_col3_width(t) for t in tables}
+    tbl_widths = {t['name']: _calc_table_width(t, tbl_col1[t['name']], tbl_col3[t['name']]) for t in tables}
     max_tbl_w  = max(tbl_widths.values(), default=MIN_TABLE_W)
-    col_step   = max_tbl_w + GAP_W   # ระยะ x ระหว่างคอลัมน์ (ใช้ตัวที่กว้างสุด)
+    col_step   = max_tbl_w + GAP_W
 
-    adj = _build_fk_graph(tables)
-    components = _connected_components(tables, adj)
+    # ── 2. Dynamic cols_per_row (fit within A4 width) ─────────────────────
+    available_w  = PAGE_W - START_X
+    cols_per_row = max(1, min(COLS_PER_ROW, (available_w + GAP_W) // col_step))
+    row_x        = [START_X + col_step * c for c in range(cols_per_row)]
+    label_w      = cols_per_row * col_step - GAP_W   # category label spans full grid
 
-    pages: list[list[dict]] = []
-    current_page: list[dict] = []
-    row_x   = [START_X + col_step * c for c in range(COLS_PER_ROW)]
-    col_idx = 0
-    cur_y   = START_Y
+    # ── 3. Group tables by category (preserve docx order) ────────────────
+    table_map  = {t['name']: t for t in tables}
+    cat_order:  list[str]        = []
+    cat_tables: dict[str, list]  = {}
+    for tbl in tables:
+        cat = tbl.get('category', '')
+        if cat not in cat_tables:
+            cat_order.append(cat)
+            cat_tables[cat] = []
+        cat_tables[cat].append(tbl)
+
+    # ── 4. Layout state ───────────────────────────────────────────────────
+    pages:        list[list[dict]] = []
+    current_page: list[dict]       = []
+    col_idx      = 0
+    row_count    = 0   # จำนวนแถวที่วางแล้วใน page ปัจจุบัน
+    cur_y        = START_Y
     max_h_in_row = 0
 
     def flush_page():
-        nonlocal current_page, col_idx, cur_y, max_h_in_row
+        nonlocal current_page, col_idx, row_count, cur_y, max_h_in_row
         if current_page:
             pages.append(current_page)
         current_page = []
-        col_idx = 0
-        cur_y   = START_Y
+        col_idx      = 0
+        row_count    = 0
+        cur_y        = START_Y
         max_h_in_row = 0
+
+    def finish_row():
+        """เลื่อน cur_y ถ้า col_idx > 0 (flush row ปัจจุบัน)"""
+        nonlocal col_idx, row_count, cur_y, max_h_in_row
+        if col_idx > 0:
+            cur_y       += max_h_in_row + GAP_H
+            max_h_in_row = 0
+            col_idx      = 0
+            row_count   += 1
+
+    def ensure_space(h: int):
+        """ตรวจสอบว่า h px พอดีในหน้าปัจจุบัน ถ้าไม่พอ flush"""
+        nonlocal col_idx, row_count, cur_y, max_h_in_row
+        if col_idx >= cols_per_row:          # row เต็ม → เลื่อน row
+            cur_y       += max_h_in_row + GAP_H
+            max_h_in_row = 0
+            col_idx      = 0
+            row_count   += 1
+        # flush ถ้าเกิน A4 หรือเกิน MAX_ROWS_PER_PAGE
+        if (cur_y + h > MAX_Y or row_count >= MAX_ROWS_PER_PAGE) and current_page:
+            flush_page()
+
+    def add_category_label(label: str):
+        nonlocal col_idx, cur_y, max_h_in_row
+        if not label:
+            return
+        finish_row()
+        if cur_y + CATEGORY_LABEL_H > MAX_Y and current_page:
+            flush_page()
+        current_page.append({
+            'type':   'category_label',
+            'label':  label,
+            'x':      START_X,
+            'y':      cur_y,
+            'width':  label_w,
+            'height': CATEGORY_LABEL_H,
+        })
+        cur_y += CATEGORY_LABEL_H + CATEGORY_LABEL_GAP
 
     def add_table(tbl: dict):
         nonlocal col_idx, cur_y, max_h_in_row
         h = _table_height(tbl)
-        if col_idx == COLS_PER_ROW:
-            cur_y += max_h_in_row + GAP_H
-            max_h_in_row = 0
-            col_idx = 0
-        t = dict(tbl)
-        t['x']      = row_x[col_idx]
-        t['y']      = cur_y
-        t['width']  = tbl_widths[tbl['name']]   # ← dynamic total width
-        t['col1_w'] = tbl_col1[tbl['name']]     # ← dynamic key-col width
-        t['col3_w'] = tbl_col3[tbl['name']]     # ← dynamic type-col width
-        t['height'] = h
+        ensure_space(h)
+        t          = dict(tbl)
+        t['x']     = row_x[col_idx]
+        t['y']     = cur_y
+        t['width'] = tbl_widths[tbl['name']]
+        t['col1_w']= tbl_col1[tbl['name']]
+        t['col3_w']= tbl_col3[tbl['name']]
+        t['height']= h
         current_page.append(t)
         max_h_in_row = max(max_h_in_row, h)
         col_idx += 1
 
-    def component_fits_on_new_row(comp: list[dict]) -> bool:
-        rows_needed = (len(comp) + COLS_PER_ROW - 1) // COLS_PER_ROW
-        max_h = max(
-            max(_table_height(t) for t in comp[i:i + COLS_PER_ROW])
-            for i in range(0, len(comp), COLS_PER_ROW)
-        )
-        offset = (max_h_in_row + GAP_H) if col_idx > 0 else 0
-        return (cur_y + offset + rows_needed * (max_h + GAP_H)) <= MAX_Y
+    def _comp_height(comp: list) -> int:
+        """คำนวณความสูงรวมของ component เมื่อวางใน grid cols_per_row"""
+        n = len(comp)
+        n_rows = math.ceil(n / cols_per_row)
+        row_heights = []
+        for r in range(n_rows):
+            chunk = comp[r * cols_per_row: (r + 1) * cols_per_row]
+            row_heights.append(max(_table_height(t) for t in chunk))
+        return sum(row_heights) + GAP_H * max(0, n_rows - 1)
 
-    for comp in components:
-        if col_idx > 0 or current_page:
-            if not component_fits_on_new_row(comp):
-                if col_idx > 0:
-                    cur_y += max_h_in_row + GAP_H
-                    max_h_in_row = 0
-                    col_idx = 0
-                if cur_y + _table_height(comp[0]) > MAX_Y:
-                    flush_page()
+    def add_component(comp: list):
+        """วาง connected component โดยพยายามให้อยู่ใน page เดียวกัน"""
+        nonlocal col_idx, row_count, cur_y, max_h_in_row
 
+        # จบ row ปัจจุบันก่อน (เพื่อให้ comp เริ่มต้นแถวใหม่เสมอ)
+        finish_row()
+
+        comp_h = _comp_height(comp)
+        page_available = MAX_Y - START_Y
+
+        # ถ้า component พอดีใน 1 page แต่ไม่พอใน page ปัจจุบัน → flush ก่อน
+        if comp_h <= page_available and current_page and (
+                cur_y + comp_h > MAX_Y or row_count >= MAX_ROWS_PER_PAGE):
+            flush_page()
+
+        # วางตารางทีละตัว (ensure_space จัดการ row wrap / page overflow)
         for tbl in comp:
-            h = _table_height(tbl)
-            if col_idx == 0 and cur_y + h > MAX_Y and current_page:
-                flush_page()
             add_table(tbl)
+
+    # ── 5. Place tables category by category ─────────────────────────────
+    for cat in cat_order:
+        cat_tbls = cat_tables[cat]
+        # FK-aware BFS within this category only
+        adj   = _build_fk_graph(cat_tbls)
+        comps = _connected_components(cat_tbls, adj)
+        add_category_label(cat)
+        for comp in comps:
+            add_component(comp)
 
     if current_page:
         pages.append(current_page)
@@ -377,8 +530,26 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
 # STEP 3 — DRAW.IO XML GENERATION
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _make_category_label_xml(item: dict) -> str:
+    """สร้าง XML สำหรับ category label bar"""
+    return (
+        f'<mxCell id="{uid()}" value="{escape_xml(item["label"])}" '
+        f'style="{STYLE_CATEGORY_LABEL}" vertex="1" parent="1">'
+        f'<mxGeometry x="{item["x"]}" y="{item["y"]}" '
+        f'width="{item["width"]}" height="{item["height"]}" as="geometry"/>'
+        f'</mxCell>'
+    )
+
+
 def _make_table_xml(tbl: dict) -> tuple[str, dict]:
-    """สร้าง XML สำหรับ 1 ตาราง พร้อม fixes ทั้ง 5 ข้อ"""
+    """
+    สร้าง XML สำหรับ 1 ตาราง — Stacked format:
+      - PK rows: แสดงแยกเป็น individual rows (30px each, bottom=1)
+      - Non-PK fields: รวมเป็น 1 stacked row → field names + datatypes
+        คั่นด้วย &#xa; (line separator ใน draw.io)
+      - Edge connections: PK row ใช้ row_id ปกติ, non-PK ทุก field ใช้
+        stacked_row_id เดียวกัน (เส้น FK จะชี้ไปที่ stacked row)
+    """
     tbl_id  = uid()
     row_ids: dict[str, str] = {}
     x, y, w, h = tbl['x'], tbl['y'], tbl['width'], tbl['height']
@@ -386,9 +557,13 @@ def _make_table_xml(tbl: dict) -> tuple[str, dict]:
     col3_w = tbl.get('col3_w', MIN_TYPE_W)   # dynamic type-col width
     col2_w = w - col1_w - col3_w             # field column = total - key - type
 
-    # Fix 3: header = "EN_NAME\nชื่อภาษาไทย"
-    thai_name  = _extract_thai_name(tbl.get('description', ''))
-    tbl_label  = escape_xml(f"{tbl['name']}\n{thai_name}")
+    # Header: continuation → "TABLE_NAME (ต่อ)", ปกติ → "EN_NAME\nThai"
+    if tbl.get('is_continuation'):
+        orig_name = tbl.get('original_name', tbl['name'])
+        tbl_label = escape_xml(f"{orig_name} (ต่อ)")
+    else:
+        thai_name = _extract_thai_name(tbl.get('description', ''))
+        tbl_label = escape_xml(f"{tbl['name']}\n{thai_name}")
 
     lines = [
         f'<mxCell id="{tbl_id}" value="{tbl_label}" '
@@ -397,52 +572,89 @@ def _make_table_xml(tbl: dict) -> tuple[str, dict]:
         f'</mxCell>',
     ]
 
+    # ── แยก PK columns กับ non-PK columns ──
+    pk_cols = [c for c in tbl['columns'] if is_pk(c.get('key', ''))]
+    non_pk_cols = [c for c in tbl['columns'] if not is_pk(c.get('key', ''))]
+
+    # ── PK rows: individual rows (30px each) ──
     row_y = 0
-    for col in tbl['columns']:
+    for col in pk_cols:
         row_id = uid()
         row_ids[col['name']] = row_id
 
-        pk = is_pk(col['key'])
-        row_style   = STYLE_ROW_PK    if pk else STYLE_ROW_NORMAL
-        field_style = STYLE_FIELD_PK  if pk else STYLE_FIELD_NORMAL
-
-        # Row container
+        # Row container (bottom=1 for PK separator line)
         lines += [
-            f'<mxCell id="{row_id}" value="" style="{row_style}" '
+            f'<mxCell id="{row_id}" value="" style="{STYLE_ROW_PK}" '
             f'vertex="1" parent="{tbl_id}">',
             f'  <mxGeometry y="{HEADER_H + row_y}" width="{w}" height="{ROW_H}" as="geometry"/>',
             f'</mxCell>',
         ]
-
-        # Key label cell — แสดงเฉพาะ PK เท่านั้น
-        key_label = "PK" if pk else ""
+        # Key cell
         lines += [
-            f'<mxCell id="{uid()}" value="{key_label}" '
+            f'<mxCell id="{uid()}" value="PK" '
             f'style="{STYLE_KEY_CELL}" vertex="1" connectable="0" parent="{row_id}">',
             f'  <mxGeometry width="{col1_w}" height="{ROW_H}" as="geometry"/>',
             f'</mxCell>',
         ]
-
-        # Field name cell (align=left)
-        field_label = escape_xml(col['name'])
+        # Field name cell (bold+underline for PK)
         lines += [
-            f'<mxCell id="{uid()}" value="{field_label}" '
-            f'style="{field_style}" vertex="1" connectable="0" parent="{row_id}">',
+            f'<mxCell id="{uid()}" value="{escape_xml(col["name"])}" '
+            f'style="{STYLE_FIELD_PK}" vertex="1" connectable="0" parent="{row_id}">',
             f'  <mxGeometry x="{col1_w}" width="{col2_w}" height="{ROW_H}" as="geometry"/>',
             f'</mxCell>',
         ]
-
-        # Datatype cell (left-align; PK row = bold+underline)
-        type_style = STYLE_TYPE_PK if pk else STYLE_TYPE_CELL
-        type_label = escape_xml(col.get('type', ''))
+        # Type cell (bold+underline for PK)
         lines += [
-            f'<mxCell id="{uid()}" value="{type_label}" '
-            f'style="{type_style}" vertex="1" connectable="0" parent="{row_id}">',
+            f'<mxCell id="{uid()}" value="{escape_xml(col.get("type", ""))}" '
+            f'style="{STYLE_TYPE_PK}" vertex="1" connectable="0" parent="{row_id}">',
             f'  <mxGeometry x="{col1_w + col2_w}" width="{col3_w}" height="{ROW_H}" as="geometry"/>',
             f'</mxCell>',
         ]
-
         row_y += ROW_H
+
+    # ── Non-PK fields: 1 stacked row ──
+    if non_pk_cols:
+        n_non_pk = len(non_pk_cols)
+        stacked_h = max(LINE_H + PAD_BOT, n_non_pk * LINE_H + PAD_BOT)
+        stacked_row_id = uid()
+
+        # ทุก non-PK field ชี้ไปที่ stacked_row_id เดียวกัน (สำหรับ edge connection)
+        for col in non_pk_cols:
+            row_ids[col['name']] = stacked_row_id
+
+        # Stacked row container
+        lines += [
+            f'<mxCell id="{stacked_row_id}" value="" style="{STYLE_ROW_STACKED}" '
+            f'vertex="1" parent="{tbl_id}">',
+            f'  <mxGeometry y="{HEADER_H + row_y}" width="{w}" height="{stacked_h}" as="geometry"/>',
+            f'</mxCell>',
+        ]
+
+        # Key cell (empty)
+        lines += [
+            f'<mxCell id="{uid()}" value="" '
+            f'style="{STYLE_STACKED_KEY}" vertex="1" connectable="0" parent="{stacked_row_id}">',
+            f'  <mxGeometry width="{col1_w}" height="{stacked_h}" as="geometry"/>',
+            f'</mxCell>',
+        ]
+
+        # Field names — joined with &#xa;
+        field_names = '&#xa;'.join(escape_xml(c['name']) for c in non_pk_cols)
+        lines += [
+            f'<mxCell id="{uid()}" value="{field_names}" '
+            f'style="{STYLE_STACKED_FIELD}" vertex="1" connectable="0" parent="{stacked_row_id}">',
+            f'  <mxGeometry x="{col1_w}" width="{col2_w}" height="{stacked_h}" as="geometry"/>',
+            f'</mxCell>',
+        ]
+
+        # Data types — joined with &#xa;
+        data_types = '&#xa;'.join(escape_xml(c.get('type', '')) for c in non_pk_cols)
+        lines += [
+            f'<mxCell id="{uid()}" value="{data_types}" '
+            f'style="{STYLE_STACKED_TYPE}" vertex="1" connectable="0" parent="{stacked_row_id}">',
+            f'  <mxGeometry x="{col1_w + col2_w}" width="{col3_w}" height="{stacked_h}" as="geometry"/>',
+            f'</mxCell>',
+        ]
 
     return '\n'.join(lines), row_ids
 
@@ -475,26 +687,72 @@ def _build_stub_tables(tables: list[dict]) -> list[dict]:
             if ref and ref not in existing:
                 refs.setdefault(ref, []).append(col['name'])
 
+    # เก็บ type ของ FK column เพื่อใช้ใน stub PK
+    ref_types: dict[str, str] = {}
+    for tbl in tables:
+        for col in tbl['columns']:
+            ref = col['ref_table']
+            if ref and ref not in existing:
+                if ref not in ref_types:
+                    ref_types[ref] = col.get('type', '')
+
     stubs = []
     for ref_name, fk_cols in sorted(refs.items()):
-        pk_col = fk_cols[0]   # infer PK จาก FK column แรกที่อ้างถึง
+        pk_col   = fk_cols[0]   # infer PK จาก FK column แรกที่อ้างถึง
+        pk_type  = ref_types.get(ref_name, '')
         stubs.append({
             "name":        ref_name,
-            "description": "",   # ไม่มีคำอธิบายภาษาไทย
+            "description": "",
+            "category":    "ตารางอ้างอิง (ภายนอก)",
             "is_stub":     True,
             "columns": [
-                {"name": pk_col, "type": "", "nullable": "", "key": "PK", "ref_table": ""},
-                {"name": "...",  "type": "", "nullable": "", "key": "",   "ref_table": ""},
+                {"name": pk_col, "type": pk_type, "nullable": "", "key": "PK", "ref_table": ""},
+                {"name": "...",  "type": "",       "nullable": "", "key": "",   "ref_table": ""},
             ],
         })
     return stubs
 
 
+def split_tall_tables(tables: list[dict]) -> list[dict]:
+    """
+    ตัดตารางที่มีคอลัมน์มากกว่า MAX_TABLE_ROWS ออกเป็นหลายส่วน
+    - ส่วนที่ 1: ชื่อตารางปกติ
+    - ส่วนที่ 2+: ชื่อตาราง + "(ต่อ)", is_continuation=True
+    - กฎ: ถ้า chunk สุดท้ายมีแค่ 1 field ให้รวมกลับ chunk ก่อนหน้า
+    """
+    result = []
+    for tbl in tables:
+        cols = tbl['columns']
+        if len(cols) <= MAX_TABLE_ROWS:
+            result.append(tbl)
+            continue
+        chunks = [cols[i:i + MAX_TABLE_ROWS]
+                  for i in range(0, len(cols), MAX_TABLE_ROWS)]
+        # ถ้า chunk สุดท้ายมีน้อยกว่า 6 field → รวมกลับ chunk ก่อนหน้า
+        # (แต่ละ chunk ที่แตกออกมาต้องมีมากกว่า 5 แถว)
+        if len(chunks) > 1 and len(chunks[-1]) <= 5:
+            chunks[-2] = chunks[-2] + chunks[-1]
+            chunks.pop()
+        for part_idx, chunk in enumerate(chunks):
+            new_tbl = dict(tbl)
+            new_tbl['columns'] = list(chunk)
+            if part_idx == 0:
+                new_tbl['is_continuation'] = False
+            else:
+                new_tbl['is_continuation'] = True
+                new_tbl['original_name']   = tbl['name']
+                new_tbl['name'] = f"{tbl['name']}__part{part_idx + 1}"
+            result.append(new_tbl)
+    return result
+
+
 def generate_drawio(tables: list[dict]) -> str:
     """Main function: tables → Draw.io XML string"""
-    # รวม stub tables สำหรับ FK ที่ชี้ไปตารางนอก data dict
-    stubs = _build_stub_tables(tables)
-    all_tables = tables + stubs
+    # 1) ตัดตารางที่ยาวเกิน MAX_TABLE_ROWS → (ต่อ)
+    split_tables = split_tall_tables(tables)
+    # 2) stub tables สำหรับ FK ที่ชี้ไปตารางนอก data dict
+    stubs = _build_stub_tables(tables)   # ใช้ original tables ตรวจ FK
+    all_tables = split_tables + stubs
 
     pages = layout_tables(all_tables)
 
@@ -504,11 +762,14 @@ def generate_drawio(tables: list[dict]) -> str:
 
     for page_idx, page_tables in enumerate(pages):
         cells: list[str] = []
-        for tbl in page_tables:
-            tbl_xml, row_id_map = _make_table_xml(tbl)
-            cells.append(tbl_xml)
-            all_row_ids[tbl['name']] = row_id_map
-            page_of_table[tbl['name']] = page_idx
+        for item in page_tables:
+            if item.get('type') == 'category_label':
+                cells.append(_make_category_label_xml(item))
+            else:
+                tbl_xml, row_id_map = _make_table_xml(item)
+                cells.append(tbl_xml)
+                all_row_ids[item['name']] = row_id_map
+                page_of_table[item['name']] = page_idx
         diagram_data.append(cells)
 
     # ── Edges ─────────────────────────────────────────────────────────────
@@ -582,6 +843,8 @@ def get_stats(tables: list[dict], pages: list[list[dict]]) -> dict:
     page_of_table = {}
     for i, pg in enumerate(pages):
         for t in pg:
+            if t.get('type') == 'category_label':
+                continue
             page_of_table[t['name']] = i
 
     table_names = {t['name'] for t in tables}
@@ -605,7 +868,7 @@ def get_stats(tables: list[dict], pages: list[list[dict]]) -> dict:
         "page_count":   len(pages),
         "pages": [
             {
-                "tables":     [t['name'] for t in pg],
+                "tables":     [t['name'] for t in pg if t.get('type') != 'category_label'],
                 "edge_count": edge_count_per_page[i],
             }
             for i, pg in enumerate(pages)
