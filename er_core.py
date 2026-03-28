@@ -379,13 +379,199 @@ def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[
 
     return components
 
+def _auto_group_tables(tables: list[dict]) -> list[tuple[str, list[dict]]]:
+    """
+    จัดกลุ่มตารางอัตโนมัติเมื่อ DataDict มีแค่ 1 category
+    ใช้ table name prefix + FK connections เป็นตัวแบ่ง
+
+    คืน list ของ (group_name, [tables]) เรียงตามลำดับใน docx
+    """
+    table_map = {t['name']: t for t in tables}
+
+    # ── Phase 1: Group by table name prefix ──────────────────────────────
+    def _norm(part: str) -> str:
+        """Strip trailing S for matching: DISPOSALS→DISPOSAL"""
+        if part.endswith('S') and len(part) > 2:
+            return part[:-1]
+        return part
+
+    def _group_key(name: str) -> str:
+        parts = name.split('_')
+
+        # MST_* / E8_BEGIN_* → config group
+        if parts[0] == 'MST' or '_'.join(parts[:2]) == 'E8_BEGIN':
+            return 'MST'
+
+        # Suffix words ที่บ่งบอกว่าเป็น detail/child table
+        detail_words = {'DETAILS', 'CONTROLS', 'DOCS', 'CHEQUES',
+                        'BIDDERS', 'RESULTS', 'COMMITTEES', 'SYSTEMS',
+                        'ORGS', 'PROFILES'}
+
+        # Normalize last meaningful segment แล้วหา core prefix
+        normed = [parts[0]] + [_norm(p) for p in parts[1:]]
+        core = list(normed)
+        while len(core) > 2 and core[-1] in {_norm(w) for w in detail_words}:
+            core.pop()
+        return '_'.join(core)
+
+    prefix_groups: dict[str, list[str]] = {}
+    name_to_key:   dict[str, str]       = {}
+    for tbl in tables:
+        key = _group_key(tbl['name'])
+        prefix_groups.setdefault(key, [])
+        prefix_groups[key].append(tbl['name'])
+        name_to_key[tbl['name']] = key
+
+    # ── Phase 2: Merge small groups that share RARE keywords ─────────────
+    # Only merge on keywords that are NOT super-common across groups
+    common_words = {'DOH', 'E8', 'E4', 'MST', 'E14', 'A2', 'A4',
+                    'DISPOSAL', 'APPROVE', 'EQUIP'}  # words too common to merge on
+
+    merged: dict[str, list[str]] = {}
+    key_remap: dict[str, str]    = {}
+
+    # Sort keys so smaller groups get processed first (merged into larger)
+    sorted_keys = sorted(prefix_groups.keys(),
+                         key=lambda k: len(prefix_groups[k]))
+
+    for key in sorted_keys:
+        if key in key_remap:
+            continue
+        my_words = set(key.split('_')) - common_words
+        best_target = None
+        best_score  = 0
+        for other_key in sorted_keys:
+            if other_key == key or other_key in key_remap:
+                continue
+            other_words = set(other_key.split('_')) - common_words
+            shared = my_words & other_words
+            if shared and len(prefix_groups[key]) <= 2:
+                score = len(shared)
+                if score > best_score and len(prefix_groups[other_key]) >= len(prefix_groups[key]):
+                    best_score  = score
+                    best_target = other_key
+        if best_target:
+            key_remap[key] = best_target
+        else:
+            merged[key] = list(prefix_groups[key])
+
+    for old_key, new_key in key_remap.items():
+        if new_key not in merged:
+            merged[new_key] = list(prefix_groups[new_key])
+        merged[new_key].extend(prefix_groups[old_key])
+        for n in prefix_groups[old_key]:
+            name_to_key[n] = new_key
+
+    # ── Phase 3: Move MST tables based on FK connections ─────────────────
+    # ถ้า MST table มี FK connection กับกลุ่มอื่น → ย้ายไปกลุ่มที่เชื่อมมากที่สุด
+    if 'MST' in merged and len(merged) > 1:
+        adj = _build_fk_graph(tables)
+        mst_names = list(merged['MST'])
+        for mst_name in mst_names:
+            # นับ FK connections ต่อกลุ่ม
+            group_counts: dict[str, int] = {}
+            for neighbor in adj.get(mst_name, set()):
+                grp = name_to_key.get(neighbor)
+                if grp and grp != 'MST':
+                    group_counts[grp] = group_counts.get(grp, 0) + 1
+
+            if not group_counts:
+                continue
+
+            # ย้ายไปกลุ่มที่มี FK connections มากที่สุด
+            max_count  = max(group_counts.values())
+            top_groups = [g for g, c in group_counts.items() if c == max_count]
+
+            if len(top_groups) == 1:
+                target_grp = top_groups[0]
+                merged['MST'].remove(mst_name)
+                merged[target_grp].append(mst_name)
+                name_to_key[mst_name] = target_grp
+
+        # ── Phase 3b: Keyword-based MST redistribution ───────────────────
+        # MST tables ที่ไม่มี FK → ย้ายตามชื่อ keyword ที่ตรงกับ group key
+        # (เฉพาะ match กับ group key เท่านั้น ไม่รวม table names ในกลุ่ม)
+        if 'MST' in merged:
+            remaining_mst = list(merged['MST'])
+            non_mst_keys  = [k for k in merged if k != 'MST']
+            for mst_name in remaining_mst:
+                mst_words = set(mst_name.split('_')) - common_words - {'MST'}
+                best_key   = None
+                best_score = 0
+                for grp_key in non_mst_keys:
+                    grp_words = set(grp_key.split('_')) - common_words
+                    shared = mst_words & grp_words
+                    if shared and len(shared) > best_score:
+                        best_score = len(shared)
+                        best_key   = grp_key
+                if best_key and best_score > 0:
+                    merged['MST'].remove(mst_name)
+                    merged[best_key].append(mst_name)
+                    name_to_key[mst_name] = best_key
+
+        # ลบกลุ่ม MST ถ้าว่าง
+        if not merged.get('MST'):
+            del merged['MST']
+
+    # ── Phase 4: Generate group names + order ────────────────────────────
+    # Build original table order map for sorting
+    orig_order = {t['name']: i for i, t in enumerate(tables)}
+
+    result: list[tuple[str, list[dict]]] = []
+    seen_names: dict[str, int] = {}
+
+    # Sort groups: MST first, then by earliest table's original position
+    sorted_keys = sorted(merged.keys(),
+                         key=lambda k: (-1 if k == 'MST' else
+                                        min(orig_order.get(n, 999) for n in merged[k])))
+
+    for key in sorted_keys:
+        names = merged[key]
+        first_tbl = table_map[names[0]]
+        desc = first_tbl.get('description', '')
+        # ดึงส่วนภาษาไทย ตัด "(TABLE_NAME)" ออก
+        group_name = re.sub(r'\s*\([A-Z][A-Z0-9_]+\)\s*$', '', desc).strip()
+        # ตัดคำว่า "ตาราง" ออกจากหน้า
+        group_name = re.sub(r'^ตาราง', '', group_name).strip()
+        if not group_name:
+            group_name = key
+
+        # Deduplicate group names by appending suffix from key
+        if group_name in seen_names:
+            seen_names[group_name] += 1
+            # Map common suffixes to Thai names
+            suffix_map = {
+                'OTHER': 'วิธีอื่น', 'PROJECT': 'เพื่อโครงการ',
+                'P126': 'พ.1-26', 'RESULT': 'ผลการจำหน่าย',
+            }
+            alt_desc = ''
+            alt_parts = key.split('_')
+            diff_parts = [p for p in alt_parts if p not in common_words and p not in {'DOH', 'E8'}]
+            for dp in diff_parts:
+                if dp in suffix_map:
+                    alt_desc = suffix_map[dp]
+                    break
+            if not alt_desc and diff_parts:
+                alt_desc = '-'.join(diff_parts).lower()
+            if alt_desc:
+                group_name = f"{group_name}-{alt_desc}"
+            else:
+                group_name = f"{group_name} ({seen_names[group_name]})"
+        else:
+            seen_names[group_name] = 1
+
+        tbls = [table_map[n] for n in names if n in table_map]
+        result.append((group_name, tbls))
+
+    return result
+
+
 def layout_tables(tables: list[dict]) -> list[list[dict]]:
     """
     จัด layout — แต่ละ category (กลุ่มธุรกรรม) = 1 sheet/page
-    - 1 category = 1 sheet (ไม่แบ่งตาม A4 overflow)
-    - Dynamic cols_per_row: คำนวณจากความกว้างจริงของตาราง
-    - FK-aware ordering ภายใน category
-    - ตารางที่ไม่มี category จะรวมอยู่ sheet เดียวกัน
+    - ถ้ามีหลาย category จาก docx → ใช้ category เป็น sheet
+    - ถ้ามีแค่ 1 category → auto-group ตาม table name prefix + FK
+    - FK-aware ordering ภายใน sheet
     """
     # ── 1. Pre-compute widths ─────────────────────────────────────────────
     tbl_col1   = {t['name']: _calc_col1_width(t) for t in tables}
@@ -400,41 +586,75 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
     row_x        = [START_X + col_step * c for c in range(cols_per_row)]
     label_w      = cols_per_row * col_step - GAP_W
 
-    # ── 3. Group tables by category (preserve docx order) ────────────────
-    cat_order:  list[str]        = []
-    cat_tables: dict[str, list]  = {}
-    for tbl in tables:
-        cat = tbl.get('category', '')
-        if cat not in cat_tables:
-            cat_order.append(cat)
-            cat_tables[cat] = []
-        cat_tables[cat].append(tbl)
+    # ── 3. Determine grouping ────────────────────────────────────────────
+    STUB_CAT = "ตารางอ้างอิง (ภายนอก)"
+    real_tables = [t for t in tables if not t.get('is_stub')]
+    stub_tables = [t for t in tables if t.get('is_stub')]
 
-    # ── 4. Layout: 1 category = 1 sheet ──────────────────────────────────
+    real_categories = set(t.get('category', '') for t in real_tables) - {''}
+    has_multiple_cats = len(real_categories) > 1
+
+    if has_multiple_cats:
+        # ใช้ category จาก docx Heading 2
+        groups: list[tuple[str, list[dict]]] = []
+        cat_order: list[str] = []
+        cat_tables: dict[str, list] = {}
+        for tbl in real_tables:
+            cat = tbl.get('category', '')
+            if cat not in cat_tables:
+                cat_order.append(cat)
+                cat_tables[cat] = []
+            cat_tables[cat].append(tbl)
+        for cat in cat_order:
+            groups.append((cat, cat_tables[cat]))
+    else:
+        # Auto-group ตาม table name prefix + FK
+        groups = _auto_group_tables(real_tables)
+
+    # ── 3b. Place stub tables into groups that reference them ──────────
+    if stub_tables:
+        # Build map: stub_name → set of groups that have FK to it
+        stub_name_set = {s['name'] for s in stub_tables}
+        stub_to_groups: dict[str, set[int]] = {s['name']: set() for s in stub_tables}
+        for gi, (gname, gtbls) in enumerate(groups):
+            for tbl in gtbls:
+                for col in tbl.get('columns', []):
+                    ref = col.get('ref_table', '')
+                    if ref in stub_name_set:
+                        stub_to_groups[ref].add(gi)
+
+        for stub in stub_tables:
+            grp_indices = stub_to_groups.get(stub['name'], set())
+            if grp_indices:
+                # Place stub in the first referencing group
+                idx = min(grp_indices)
+                groups[idx][1].append(stub)
+            else:
+                # No group references this stub → add to a dedicated sheet
+                groups.append((STUB_CAT, [stub]))
+
+    # ── 4. Layout: 1 group = 1 sheet ─────────────────────────────────────
     pages: list[list[dict]] = []
 
-    for cat in cat_order:
-        cat_tbls = cat_tables[cat]
-        # FK-aware ordering within this category
-        adj   = _build_fk_graph(cat_tbls)
-        comps = _connected_components(cat_tbls, adj)
-
-        # Flatten components into ordered list
+    for group_name, group_tbls in groups:
+        # FK-aware ordering within group
+        adj   = _build_fk_graph(group_tbls)
+        comps = _connected_components(group_tbls, adj)
         ordered_tbls: list[dict] = []
         for comp in comps:
             ordered_tbls.extend(comp)
 
-        # Build page items for this category
+        # Build page items
         page_items: list[dict] = []
         col_idx      = 0
         cur_y        = START_Y
         max_h_in_row = 0
 
-        # Category label
-        if cat:
+        # Category/group label
+        if group_name:
             page_items.append({
                 'type':   'category_label',
-                'label':  cat,
+                'label':  group_name,
                 'x':      START_X,
                 'y':      cur_y,
                 'width':  label_w,
@@ -442,11 +662,10 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
             })
             cur_y += CATEGORY_LABEL_H + CATEGORY_LABEL_GAP
 
-        # Place tables in grid (cols_per_row columns, unlimited rows)
+        # Place tables in grid
         for tbl in ordered_tbls:
             h = _table_height(tbl)
 
-            # Wrap to next row if current row is full
             if col_idx >= cols_per_row:
                 cur_y       += max_h_in_row + GAP_H
                 max_h_in_row = 0
