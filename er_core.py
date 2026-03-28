@@ -381,11 +381,11 @@ def _connected_components(tables: list[dict], adj: dict[str, set]) -> list[list[
 
 def layout_tables(tables: list[dict]) -> list[list[dict]]:
     """
-    จัด layout A4 Landscape พร้อม:
-    - Dynamic cols_per_row: คำนวณจากความกว้างจริงของตาราง ไม่ให้เกิน A4
-    - Strict A4 boundary: ทุก element อยู่ภายใน MAX_Y เสมอ
-    - Category grouping: จัดหมวดหมู่ตาม Heading 2 ในเอกสาร
-    - FK-aware (within category): ตารางที่มี FK ถึงกันอยู่ page เดียวกัน
+    จัด layout — แต่ละ category (กลุ่มธุรกรรม) = 1 sheet/page
+    - 1 category = 1 sheet (ไม่แบ่งตาม A4 overflow)
+    - Dynamic cols_per_row: คำนวณจากความกว้างจริงของตาราง
+    - FK-aware ordering ภายใน category
+    - ตารางที่ไม่มี category จะรวมอยู่ sheet เดียวกัน
     """
     # ── 1. Pre-compute widths ─────────────────────────────────────────────
     tbl_col1   = {t['name']: _calc_col1_width(t) for t in tables}
@@ -398,10 +398,9 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
     available_w  = PAGE_W - START_X
     cols_per_row = max(1, min(COLS_PER_ROW, (available_w + GAP_W) // col_step))
     row_x        = [START_X + col_step * c for c in range(cols_per_row)]
-    label_w      = cols_per_row * col_step - GAP_W   # category label spans full grid
+    label_w      = cols_per_row * col_step - GAP_W
 
     # ── 3. Group tables by category (preserve docx order) ────────────────
-    table_map  = {t['name']: t for t in tables}
     cat_order:  list[str]        = []
     cat_tables: dict[str, list]  = {}
     for tbl in tables:
@@ -411,118 +410,61 @@ def layout_tables(tables: list[dict]) -> list[list[dict]]:
             cat_tables[cat] = []
         cat_tables[cat].append(tbl)
 
-    # ── 4. Layout state ───────────────────────────────────────────────────
-    pages:        list[list[dict]] = []
-    current_page: list[dict]       = []
-    col_idx      = 0
-    row_count    = 0   # จำนวนแถวที่วางแล้วใน page ปัจจุบัน
-    cur_y        = START_Y
-    max_h_in_row = 0
+    # ── 4. Layout: 1 category = 1 sheet ──────────────────────────────────
+    pages: list[list[dict]] = []
 
-    def flush_page():
-        nonlocal current_page, col_idx, row_count, cur_y, max_h_in_row
-        if current_page:
-            pages.append(current_page)
-        current_page = []
+    for cat in cat_order:
+        cat_tbls = cat_tables[cat]
+        # FK-aware ordering within this category
+        adj   = _build_fk_graph(cat_tbls)
+        comps = _connected_components(cat_tbls, adj)
+
+        # Flatten components into ordered list
+        ordered_tbls: list[dict] = []
+        for comp in comps:
+            ordered_tbls.extend(comp)
+
+        # Build page items for this category
+        page_items: list[dict] = []
         col_idx      = 0
-        row_count    = 0
         cur_y        = START_Y
         max_h_in_row = 0
 
-    def finish_row():
-        """เลื่อน cur_y ถ้า col_idx > 0 (flush row ปัจจุบัน)"""
-        nonlocal col_idx, row_count, cur_y, max_h_in_row
-        if col_idx > 0:
-            cur_y       += max_h_in_row + GAP_H
-            max_h_in_row = 0
-            col_idx      = 0
-            row_count   += 1
+        # Category label
+        if cat:
+            page_items.append({
+                'type':   'category_label',
+                'label':  cat,
+                'x':      START_X,
+                'y':      cur_y,
+                'width':  label_w,
+                'height': CATEGORY_LABEL_H,
+            })
+            cur_y += CATEGORY_LABEL_H + CATEGORY_LABEL_GAP
 
-    def ensure_space(h: int):
-        """ตรวจสอบว่า h px พอดีในหน้าปัจจุบัน ถ้าไม่พอ flush"""
-        nonlocal col_idx, row_count, cur_y, max_h_in_row
-        if col_idx >= cols_per_row:          # row เต็ม → เลื่อน row
-            cur_y       += max_h_in_row + GAP_H
-            max_h_in_row = 0
-            col_idx      = 0
-            row_count   += 1
-        # flush ถ้าเกิน A4 หรือเกิน MAX_ROWS_PER_PAGE
-        if (cur_y + h > MAX_Y or row_count >= MAX_ROWS_PER_PAGE) and current_page:
-            flush_page()
+        # Place tables in grid (cols_per_row columns, unlimited rows)
+        for tbl in ordered_tbls:
+            h = _table_height(tbl)
 
-    def add_category_label(label: str):
-        nonlocal col_idx, cur_y, max_h_in_row
-        if not label:
-            return
-        finish_row()
-        if cur_y + CATEGORY_LABEL_H > MAX_Y and current_page:
-            flush_page()
-        current_page.append({
-            'type':   'category_label',
-            'label':  label,
-            'x':      START_X,
-            'y':      cur_y,
-            'width':  label_w,
-            'height': CATEGORY_LABEL_H,
-        })
-        cur_y += CATEGORY_LABEL_H + CATEGORY_LABEL_GAP
+            # Wrap to next row if current row is full
+            if col_idx >= cols_per_row:
+                cur_y       += max_h_in_row + GAP_H
+                max_h_in_row = 0
+                col_idx      = 0
 
-    def add_table(tbl: dict):
-        nonlocal col_idx, cur_y, max_h_in_row
-        h = _table_height(tbl)
-        ensure_space(h)
-        t          = dict(tbl)
-        t['x']     = row_x[col_idx]
-        t['y']     = cur_y
-        t['width'] = tbl_widths[tbl['name']]
-        t['col1_w']= tbl_col1[tbl['name']]
-        t['col3_w']= tbl_col3[tbl['name']]
-        t['height']= h
-        current_page.append(t)
-        max_h_in_row = max(max_h_in_row, h)
-        col_idx += 1
+            t          = dict(tbl)
+            t['x']     = row_x[col_idx]
+            t['y']     = cur_y
+            t['width'] = tbl_widths[tbl['name']]
+            t['col1_w']= tbl_col1[tbl['name']]
+            t['col3_w']= tbl_col3[tbl['name']]
+            t['height']= h
+            page_items.append(t)
+            max_h_in_row = max(max_h_in_row, h)
+            col_idx += 1
 
-    def _comp_height(comp: list) -> int:
-        """คำนวณความสูงรวมของ component เมื่อวางใน grid cols_per_row"""
-        n = len(comp)
-        n_rows = math.ceil(n / cols_per_row)
-        row_heights = []
-        for r in range(n_rows):
-            chunk = comp[r * cols_per_row: (r + 1) * cols_per_row]
-            row_heights.append(max(_table_height(t) for t in chunk))
-        return sum(row_heights) + GAP_H * max(0, n_rows - 1)
-
-    def add_component(comp: list):
-        """วาง connected component โดยพยายามให้อยู่ใน page เดียวกัน"""
-        nonlocal col_idx, row_count, cur_y, max_h_in_row
-
-        # จบ row ปัจจุบันก่อน (เพื่อให้ comp เริ่มต้นแถวใหม่เสมอ)
-        finish_row()
-
-        comp_h = _comp_height(comp)
-        page_available = MAX_Y - START_Y
-
-        # ถ้า component พอดีใน 1 page แต่ไม่พอใน page ปัจจุบัน → flush ก่อน
-        if comp_h <= page_available and current_page and (
-                cur_y + comp_h > MAX_Y or row_count >= MAX_ROWS_PER_PAGE):
-            flush_page()
-
-        # วางตารางทีละตัว (ensure_space จัดการ row wrap / page overflow)
-        for tbl in comp:
-            add_table(tbl)
-
-    # ── 5. Place tables category by category ─────────────────────────────
-    for cat in cat_order:
-        cat_tbls = cat_tables[cat]
-        # FK-aware BFS within this category only
-        adj   = _build_fk_graph(cat_tbls)
-        comps = _connected_components(cat_tbls, adj)
-        add_category_label(cat)
-        for comp in comps:
-            add_component(comp)
-
-    if current_page:
-        pages.append(current_page)
+        if page_items:
+            pages.append(page_items)
 
     return pages
 
@@ -811,9 +753,18 @@ def generate_drawio(tables: list[dict]) -> str:
         '<mxfile host="app.diagrams.net" type="device">',
     ]
 
+    # Extract sheet names from category labels
+    sheet_names: list[str] = []
+    for page_tables in pages:
+        cat_label = next((item['label'] for item in page_tables
+                          if item.get('type') == 'category_label'), '')
+        sheet_names.append(cat_label or f"Sheet{len(sheet_names) + 1}")
+
     for page_idx, cells in enumerate(diagram_data):
+        sheet_name = escape_xml(sheet_names[page_idx] if page_idx < len(sheet_names)
+                                else f"Sheet{page_idx + 1}")
         parts += [
-            f'  <diagram name="Sheet{page_idx + 1}" id="{uid()}">',
+            f'  <diagram name="{sheet_name}" id="{uid()}">',
             f'    <mxGraphModel dx="1620" dy="860" grid="1" gridSize="10" '
             f'guides="1" tooltips="1" connect="1" arrows="1" fold="1" '
             f'page="1" pageScale="1" pageWidth="{PAGE_W}" pageHeight="{PAGE_H}" '
